@@ -16,4 +16,8 @@ def verify(
             return False
     except ValueError:
         return False
-    return hmac.compare_digest(sign(secret, timestamp, delivery_id, body), signature)
+    try:
+        supplied = signature.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(sign(secret, timestamp, delivery_id, body).encode("ascii"), supplied)

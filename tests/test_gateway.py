@@ -207,6 +207,7 @@ def test_signature_tamper_and_expiry():
     assert not verify("secret", now, "id", b"changed", signature)
     assert not verify("secret", "1", "id", b"body", sign("secret", "1", "id", b"body"))
     assert not verify("secret", "invalid", "id", b"body", signature)
+    assert not verify("secret", now, "id", b"body", "非ASCII签名")
 
 
 def test_secret_redaction():
