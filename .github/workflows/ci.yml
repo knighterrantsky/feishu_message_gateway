@@ -1,0 +1,138 @@
+name: CI and release
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Existing full 40-character commit SHA to deploy/roll back; empty builds current main'
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.10.7'
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run ruff check gateway tests scripts
+      - run: uv run ruff format --check gateway tests scripts
+      - run: uv run mypy gateway scripts/deploy.py
+      - run: uv run pytest -q
+      - name: Check OpenAPI is current
+        run: |
+          uv run python -m scripts.export_openapi
+          git diff --exit-code -- docs/openapi.json
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: gateway:test
+          build-args: CODE_VERSION=${{ github.sha }}
+      - name: Container smoke test (non-root, PORT, health, version, persistence)
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          docker run --rm gateway:test sh -c 'test "$(id -u)" = 10001'
+          docker volume create gateway-ci
+          docker run -d --name gateway-ci -p 18080:9090 -v gateway-ci:/data \
+            -e PORT=9090 -e FEISHU_APP_ID=cli_test -e FEISHU_APP_SECRET=test \
+            -e WEBHOOK_URL=https://example.invalid/events \
+            -e WEBHOOK_SIGNING_SECRET=ssssssssssssssssssssssssssssssss \
+            -e API_ACCESS_TOKEN=tttttttttttttttttttttttttttttttt gateway:test
+          trap 'docker logs gateway-ci; docker rm -f gateway-ci; docker volume rm gateway-ci' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/healthz > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          jq -e --arg sha "$EXPECTED_SHA" '.version == $sha' /tmp/health.json
+          docker restart gateway-ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/healthz; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:18080/healthz
+          docker exec gateway-ci test -f /data/gateway.sqlite3
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Resolve immutable version
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.image_tag }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          tag="${REQUESTED_TAG:-$CURRENT_SHA}"
+          [[ "$tag" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify historical image exists
+        if: inputs.image_tag != ''
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: docker buildx imagetools inspect "ghcr.io/knighterrantsky/feishu_message_gateway:$TAG"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        if: inputs.image_tag == ''
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/knighterrantsky/feishu_message_gateway:${{ steps.version.outputs.tag }}
+          build-args: CODE_VERSION=${{ steps.version.outputs.tag }}
+  deploy:
+    needs: publish
+    if: vars.ZEABUR_SERVICE_ID != ''
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    concurrency:
+      group: zeabur-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Skip superseded automatic releases
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          head=$(gh api repos/knighterrantsky/feishu_message_gateway/commits/main --jq .sha)
+          if [[ "$EVENT" == workflow_dispatch || "$head" == "$RELEASE_SHA" ]]; then
+            echo 'deploy=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        if: steps.current.outputs.deploy == 'true'
+        with:
+          version: '0.10.7'
+      - if: steps.current.outputs.deploy == 'true'
+        run: uv sync --frozen --no-dev --python 3.12
+      - name: Update Zeabur and verify health/readiness/version
+        if: steps.current.outputs.deploy == 'true'
+        env:
+          ZEABUR_API_TOKEN: ${{ secrets.ZEABUR_API_TOKEN }}
+          ZEABUR_SERVICE_ID: ${{ vars.ZEABUR_SERVICE_ID }}
+          ZEABUR_ENVIRONMENT_ID: ${{ vars.ZEABUR_ENVIRONMENT_ID }}
+          GATEWAY_BASE_URL: ${{ vars.GATEWAY_BASE_URL }}
+          IMAGE_TAG: ${{ needs.publish.outputs.tag }}
+        run: uv run python scripts/deploy.py
