@@ -24,7 +24,7 @@
 ## 流水线行为
 
 - PR：锁定依赖安装、Ruff lint/format、Mypy、测试、OpenAPI 同步检查、Docker 多阶段构建、只读根文件系统/非 root/PORT/健康/重启 smoke test。
-- 主分支：以上检查通过后发布 Git SHA 标签镜像，再调用 Zeabur 官方 GraphQL `updateServiceImage`。
+- 主分支：以上检查通过后发布 Git SHA 标签镜像，再调用 Zeabur 当前 GraphQL `updateServiceImageTag` 更新镜像标签。此接口已在 2026-09-13 通过线上 schema 核对；旧 CLI 中的 `updateServiceImage` 已不在当前 schema，不能沿用。
 - 部署：`production` 并发组保证同一环境不并行更新，不取消正在进行的部署。自动部署检查主分支当前 SHA，跳过已经被更新提交取代的构建。
 - 验证：每 5 秒检查 `/healthz` 和 `/readyz`，两者均返回 200 且版本等于目标 SHA，连续三次才成功。最多 60 轮（网络异常时耗时更长），整个部署 job 上限 20 分钟。
 - Actions 的并发组会合并等待中的运行，不能保证每个中间提交都部署。主分支应保持最新可部署状态。

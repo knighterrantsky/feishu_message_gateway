@@ -10,7 +10,7 @@ import httpx
 
 MUTATION = """mutation UpdateGatewayImage($serviceID: ObjectID!,
     $environmentID: ObjectID!, $tag: String!) {
-    updateServiceImage(serviceID: $serviceID, environmentID: $environmentID, tag: $tag)
+    updateServiceImageTag(serviceID: $serviceID, environmentID: $environmentID, tag: $tag)
 }"""
 
 
@@ -34,7 +34,7 @@ def update_image(
     )
     response.raise_for_status()
     payload = response.json()
-    if payload.get("errors") or payload.get("data", {}).get("updateServiceImage") is not True:
+    if payload.get("errors") or payload.get("data", {}).get("updateServiceImageTag") is not True:
         raise RuntimeError("Zeabur image update rejected; inspect the service dashboard")
 
 

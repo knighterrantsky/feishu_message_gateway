@@ -12,9 +12,9 @@ def test_update_uses_official_graphql_contract():
 
         body = json.loads(request.content)
         assert body["variables"] == {"serviceID": "svc", "environmentID": "env", "tag": SHA}
-        assert "updateServiceImage" in body["query"]
+        assert "updateServiceImageTag" in body["query"]
         assert request.headers["Authorization"] == "Bearer secret"
-        return httpx.Response(200, json={"data": {"updateServiceImage": True}})
+        return httpx.Response(200, json={"data": {"updateServiceImageTag": True}})
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         update_image(client, "secret", "svc", "env", SHA)
