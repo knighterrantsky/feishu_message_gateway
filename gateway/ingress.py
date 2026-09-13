@@ -2,10 +2,9 @@ import json
 from typing import Any
 
 from gateway.config import Settings
-from gateway.store import Store
 
 
-def receive(raw: dict[str, Any], store: Store, settings: Settings, bot_id: str) -> str | None:
+def normalize(raw: dict[str, Any], settings: Settings, bot_id: str) -> dict[str, Any] | None:
     header, event = raw["header"], raw["event"]
     if header.get("app_id") != settings.feishu_app_id:
         return None
@@ -27,21 +26,17 @@ def receive(raw: dict[str, Any], store: Store, settings: Settings, bot_id: str) 
     text = json.loads(message["content"])["text"]
     if not isinstance(text, str):
         raise ValueError("invalid_text_content")
-    event_body = {
+    return {
         "schema_version": "1.0",
         "type": "message.received",
         "app_id": header["app_id"],
         "event_id": header["event_id"],
         "message_id": message["message_id"],
         "chat_id": chat_id,
+        "conversation_id": f"feishu:{header['app_id']}:{chat_id}",
         "chat_type": message["chat_type"],
         "sender": sender["sender_id"],
         "text": text,
         "mentions": mentions,
         "create_time": message["create_time"],
     }
-    # message_id is stable even if upstream resends with a different event envelope.
-    row = store.enqueue(
-        "webhook", chat_id, f"event:{header['app_id']}:{message['message_id']}", event_body
-    )
-    return str(row["delivery_id"])

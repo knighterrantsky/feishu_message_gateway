@@ -21,9 +21,9 @@ jobs:
           version: '0.10.7'
           enable-cache: true
       - run: uv sync --frozen --python 3.12
-      - run: uv run ruff check gateway tests scripts
-      - run: uv run ruff format --check gateway tests scripts
-      - run: uv run mypy gateway scripts/deploy.py
+      - run: uv run ruff check gateway tests scripts examples
+      - run: uv run ruff format --check gateway tests scripts examples
+      - run: uv run mypy gateway scripts examples
       - run: uv run pytest -q
       - name: Check OpenAPI is current
         run: |
@@ -36,30 +36,31 @@ jobs:
           load: true
           tags: gateway:test
           build-args: CODE_VERSION=${{ github.sha }}
-      - name: Container smoke test (non-root, PORT, health, version, persistence)
+      - name: Container smoke test (read-only, non-root, PORT, health, restart)
         env:
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           docker run --rm gateway:test sh -c 'test "$(id -u)" = 10001'
-          docker volume create gateway-ci
-          docker run -d --name gateway-ci -p 18080:9090 -v gateway-ci:/data \
-            -e PORT=9090 -e FEISHU_APP_ID=cli_test -e FEISHU_APP_SECRET=test \
-            -e WEBHOOK_URL=https://example.invalid/events \
-            -e WEBHOOK_SIGNING_SECRET=ssssssssssssssssssssssssssssssss \
-            -e API_ACCESS_TOKEN=tttttttttttttttttttttttttttttttt gateway:test
-          trap 'docker logs gateway-ci; docker rm -f gateway-ci; docker volume rm gateway-ci' EXIT
+          docker run -d --name gateway-ci --read-only --tmpfs /tmp:size=16m \
+            -p 18080:9090 -e PORT=9090 -e FEISHU_APP_ID=cli_test -e FEISHU_APP_SECRET=test \
+            -e GATEWAY_ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            -e TOKEN_SIGNING_KEY=ssssssssssssssssssssssssssssssss gateway:test
+          trap 'docker logs gateway-ci; docker rm -f gateway-ci' EXIT
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:18080/healthz > /tmp/health.json; then break; fi
             sleep 1
           done
           jq -e --arg sha "$EXPECTED_SHA" '.version == $sha' /tmp/health.json
+          # Fake Feishu credentials must never report ready.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/readyz)" = 503
           docker restart gateway-ci
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:18080/healthz; then break; fi
             sleep 1
           done
           curl -fsS http://localhost:18080/healthz
-          docker exec gateway-ci test -f /data/gateway.sqlite3
+          docker exec gateway-ci sh -c 'test ! -e /data/gateway.sqlite3'
+
   publish:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: checks

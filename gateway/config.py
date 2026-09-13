@@ -1,6 +1,4 @@
-from pathlib import Path
-from typing import Literal, Self
-from urllib.parse import urlsplit
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -8,24 +6,32 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
-    feishu_app_id: str = Field(min_length=1)
+    feishu_app_id: str = Field(min_length=1, max_length=128)
     feishu_app_secret: SecretStr
-    webhook_url: str
-    webhook_signing_secret: SecretStr
-    api_access_token: SecretStr
+    gateway_admin_token: SecretStr
+    token_signing_key: SecretStr
+    token_issuer: str = "feishu-message-gateway"
+    token_audience: str = "feishu-message-gateway-clients"
+    token_max_ttl_seconds: int = Field(default=86400, ge=1, le=604800)
     user_allowlist: str = ""
     chat_allowlist: str = ""
-    data_dir: Path = Path("data")
     port: int = Field(default=8080, ge=1, le=65535)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    retry_max_attempts: int = Field(default=8, ge=1, le=100)
-    retry_base_seconds: float = Field(default=2, ge=0.1, le=3600)
-    retry_max_seconds: float = Field(default=300, ge=0.1, le=86400)
-    request_timeout_seconds: float = Field(default=15, ge=1, le=60)
+    request_timeout_seconds: float = Field(default=15, ge=0.1, le=60)
     shutdown_timeout_seconds: float = Field(default=25, ge=2, le=120)
+    max_connections: int = Field(default=100, ge=1, le=10000)
+    max_subscriptions_per_connection: int = Field(default=16, ge=1, le=100)
+    max_message_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    connection_buffer_messages: int = Field(default=100, ge=1, le=10000)
+    connection_buffer_bytes: int = Field(default=1048576, ge=1024, le=16777216)
+    total_buffer_bytes: int = Field(default=33554432, ge=1024, le=1073741824)
+    ws_write_timeout_seconds: float = Field(default=5, gt=0, le=60)
+    ws_auth_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    max_outbound_requests: int = Field(default=16, ge=1, le=100)
+    idempotency_cache_entries: int = Field(default=10000, ge=1, le=1000000)
     code_version: str = "dev"
 
-    @field_validator("api_access_token", "webhook_signing_secret")
+    @field_validator("gateway_admin_token", "token_signing_key")
     @classmethod
     def strong_secret(cls, value: SecretStr) -> SecretStr:
         if len(value.get_secret_value()) < 32:
@@ -39,22 +45,12 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return value
 
-    @field_validator("webhook_url")
-    @classmethod
-    def valid_url(cls, value: str) -> str:
-        url = urlsplit(value)
-        if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.fragment:
-            raise ValueError("must be an HTTP(S) URL without credentials or fragment")
-        if url.port is not None and not 1 <= url.port <= 65535:
-            raise ValueError("invalid Webhook port")
-        return value
-
     @model_validator(mode="after")
-    def retry_bounds(self) -> Self:
-        if self.retry_max_seconds < self.retry_base_seconds:
-            raise ValueError("RETRY_MAX_SECONDS must be >= RETRY_BASE_SECONDS")
+    def bounds(self) -> "Settings":
         if self.shutdown_timeout_seconds <= self.request_timeout_seconds:
-            raise ValueError("SHUTDOWN_TIMEOUT_SECONDS must exceed REQUEST_TIMEOUT_SECONDS")
+            raise ValueError("shutdown timeout must exceed request timeout")
+        if self.gateway_admin_token == self.token_signing_key:
+            raise ValueError("administration and signing keys must differ")
         return self
 
     @property

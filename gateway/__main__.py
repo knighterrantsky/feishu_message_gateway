@@ -21,6 +21,11 @@ def main() -> None:
         port=settings.port,
         access_log=False,
         log_config=None,
+        # This pinned backend honors ws_max_queue; recheck on Uvicorn upgrades.
+        ws="websockets",
+        ws_max_size=settings.max_message_bytes,
+        ws_max_queue=4,
+        ws_per_message_deflate=False,
         timeout_graceful_shutdown=int(settings.shutdown_timeout_seconds),
     )
 

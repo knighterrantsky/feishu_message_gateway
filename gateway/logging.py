@@ -25,16 +25,18 @@ def configure(settings: Settings) -> None:
         Redactor(
             [
                 settings.feishu_app_secret.get_secret_value(),
-                settings.api_access_token.get_secret_value(),
-                settings.webhook_signing_secret.get_secret_value(),
-                settings.webhook_url,
+                settings.gateway_admin_token.get_secret_value(),
+                settings.token_signing_key.get_secret_value(),
             ]
         )
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logging.basicConfig(level=settings.log_level, handlers=[handler], force=True)
+    # Uvicorn passes its own logger into the WS protocol; DEBUG there prints raw frames.
+    for name in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        logging.getLogger(name).setLevel(max(logging.INFO, getattr(logging, settings.log_level)))
     # SDK debug logs include complete message content and authenticated WS URLs.
-    for name in ("Lark", "lark_oapi", "httpx", "httpcore", "websockets"):
+    for name in ("Lark", "lark_oapi", "httpx", "httpcore", "websockets", "urllib3"):
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.addHandler(logging.NullHandler())
