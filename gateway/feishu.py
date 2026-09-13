@@ -3,13 +3,14 @@ import json
 import logging
 import multiprocessing
 import signal
+import socket
+import struct
 import time
 from typing import Any
 
 from gateway.config import Settings
-from gateway.ingress import receive
+from gateway.ingress import normalize
 from gateway.logging import configure
-from gateway.store import Store
 
 
 class UpstreamError(Exception):
@@ -35,7 +36,7 @@ class Feishu:
     def check(response: Any) -> None:
         if not response.success():
             code = str(response.code)
-            # Unknown failures remain retryable but bounded. No raw upstream text in logs/API.
+            # No raw upstream text in logs/API. Retries remain a caller decision.
             permanent = {"230001", "230002", "230006", "230013", "230015", "230017"}
             raise UpstreamError("feishu_" + code, code not in permanent)
 
@@ -64,7 +65,7 @@ class Feishu:
             raise UpstreamError("message_not_found", False)
         return str(response.data.items[0].chat_id)
 
-    def send(self, row: dict[str, Any]) -> str:
+    def send(self, kind: str, chat_id: str, target: str, text: str, stable_uuid: str) -> str:
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest,
             CreateMessageRequestBody,
@@ -72,15 +73,14 @@ class Feishu:
             ReplyMessageRequestBody,
         )
 
-        payload = json.loads(row["payload"])
-        content = json.dumps({"text": payload["text"]}, ensure_ascii=False)
-        if row["kind"] == "send":
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        if kind == "send":
             body = (
                 CreateMessageRequestBody.builder()
-                .receive_id(row["chat_id"])
+                .receive_id(chat_id)
                 .msg_type("text")
                 .content(content)
-                .uuid(row["delivery_id"])
+                .uuid(stable_uuid)
                 .build()
             )
             response = self.client.im.v1.message.create(
@@ -91,20 +91,40 @@ class Feishu:
                 ReplyMessageRequestBody.builder()
                 .msg_type("text")
                 .content(content)
-                .uuid(row["delivery_id"])
+                .uuid(stable_uuid)
                 .build()
             )
             response = self.client.im.v1.message.reply(
-                ReplyMessageRequest.builder()
-                .message_id(payload["message_id"])
-                .request_body(reply_body)
-                .build()
+                ReplyMessageRequest.builder().message_id(target).request_body(reply_body).build()
             )
         self.check(response)
+        if not response.data or not response.data.message_id:
+            raise ValueError("missing_message_id")
         return str(response.data.message_id)
 
 
-def receiver_main(settings: Settings, connected: Any, activity: Any, stop: Any) -> None:
+def forward_event(
+    raw: dict[str, Any], settings: Settings, bot_id: str, output: socket.socket
+) -> None:
+    event = normalize(raw, settings, bot_id)
+    if event is None:
+        return
+    payload = json.dumps(event, ensure_ascii=False).encode()
+    if len(payload) > settings.max_message_bytes:
+        logging.getLogger(__name__).warning("ingress_message_too_large")
+        return
+    packet = struct.pack("!I", len(payload)) + payload
+    try:
+        if output.send(packet) != len(packet):
+            raise SystemExit(3)
+    except OSError:
+        # Closing a partial stream prevents corrupt frame boundaries after congestion.
+        raise SystemExit(3) from None
+
+
+def receiver_main(
+    settings: Settings, connected: Any, activity: Any, stop: Any, output: socket.socket
+) -> None:
     """SDK owns a dedicated process/event loop; isolate its synchronous discovery calls."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -113,7 +133,7 @@ def receiver_main(settings: Settings, connected: Any, activity: Any, stop: Any) 
 
     ws_module.loop = loop
     configure(settings)
-    store = Store(settings.data_dir)
+    output.setblocking(False)
     ws: Any = None
 
     def terminate(signum: int, frame: Any) -> None:
@@ -132,8 +152,8 @@ def receiver_main(settings: Settings, connected: Any, activity: Any, stop: Any) 
             return
 
         def callback(data: Any) -> None:
-            # Synchronous transaction completes BEFORE official SDK emits success ACK.
-            receive(json.loads(lark.JSON.marshal(data)), store, settings, bot_id)
+            # Best effort: returning permits SDK ACK, not proof of client receipt.
+            forward_event(json.loads(lark.JSON.marshal(data)), settings, bot_id, output)
 
         dispatcher = (
             lark.EventDispatcherHandler.builder("", "")
@@ -161,6 +181,7 @@ def receiver_main(settings: Settings, connected: Any, activity: Any, stop: Any) 
     except (Exception, SystemExit):
         logging.getLogger(__name__).info("receiver_stopped")
     finally:
+        output.close()
         connected.value = 0
         if ws is not None:
             ws._auto_reconnect = False
@@ -182,6 +203,10 @@ class Receiver:
         self.activity = self.context.Value("d", 0.0)
         self.stop_event = self.context.Event()
         self.process: Any = None
+        self.input: socket.socket | None = None
+        self.buffer = bytearray()
+        self.restarts = 0
+        self.terminating_at: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -193,13 +218,23 @@ class Receiver:
 
     def start(self) -> None:
         self.stop_event.clear()
+        self.heartbeat.value = 0
+        self.terminating_at = None
         self.activity.value = time.monotonic()
+        if self.input is not None:
+            self.input.close()
+        self.buffer.clear()
+        self.input, output = socket.socketpair()
+        self.input.setblocking(False)
+        output.setblocking(False)
+        output.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
         self.process = self.context.Process(
             target=receiver_main,
-            args=(self.settings, self.heartbeat, self.activity, self.stop_event),
+            args=(self.settings, self.heartbeat, self.activity, self.stop_event, output),
             daemon=True,
         )
         self.process.start()
+        output.close()
 
     def ensure_alive(self) -> None:
         if (
@@ -209,14 +244,43 @@ class Receiver:
             and time.monotonic() - self.activity.value > 90
         ):
             # Official SDK endpoint discovery has no HTTP timeout; recover a stuck loop.
-            self.process.terminate()
-            self.process.join(3)
-            if self.process.is_alive():
+            if self.terminating_at is None:
+                self.process.terminate()
+                self.terminating_at = time.monotonic()
+            elif time.monotonic() - self.terminating_at >= 3:
                 self.process.kill()
-                self.process.join()
         if self.process and not self.process.is_alive() and not self.stop_event.is_set():
-            self.process.join()
+            self.process.join(0)
+            self.restarts += 1
             self.start()
+
+    def drain(self, limit: int = 32) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if self.input is None:
+            return events
+        while len(events) < limit:
+            if len(self.buffer) >= 4:
+                size = struct.unpack("!I", self.buffer[:4])[0]
+                if size > self.settings.max_message_bytes:
+                    self.input.close()
+                    self.input = None
+                    self.buffer.clear()
+                    break
+                if len(self.buffer) >= 4 + size:
+                    events.append(json.loads(self.buffer[4 : 4 + size]))
+                    del self.buffer[: 4 + size]
+                    continue
+            try:
+                chunk = self.input.recv(65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                self.input.close()
+                self.input = None
+                self.buffer.clear()
+                break
+            self.buffer.extend(chunk)
+        return events
 
     def close(self) -> None:
         self.stop_event.set()
@@ -228,3 +292,8 @@ class Receiver:
             if self.process.is_alive():
                 self.process.kill()
                 self.process.join()
+
+        if self.input is not None:
+            self.input.close()
+            self.input = None
+        self.buffer.clear()

@@ -1,23 +1,27 @@
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
+
+from pydantic import SecretStr
 
 from gateway.app import create_app
 from gateway.config import Settings
 
-with TemporaryDirectory() as directory:
-    settings = Settings(
+
+def main() -> None:
+    settings = Settings(  # type: ignore[call-arg]  # BaseSettings runtime-only _env_file option.
         feishu_app_id="documentation",
-        feishu_app_secret="placeholder",
-        webhook_url="https://example.invalid/events",
-        webhook_signing_secret="x" * 32,
-        api_access_token="x" * 32,
-        data_dir=Path(directory),
+        feishu_app_secret=SecretStr("placeholder"),
+        gateway_admin_token=SecretStr("a" * 32),
+        token_signing_key=SecretStr("s" * 32),
+        code_version="dev",
         _env_file=None,
     )
-    # No lifespan/network is started to generate the document.
-    app = create_app(settings, feishu=object(), receiver=object(), run_worker=False)
+    # Do not start lifespan, SDK processes or any network requests.
+    app = create_app(settings, feishu=object(), receiver=object())
     Path("docs/openapi.json").write_text(
         json.dumps(app.openapi(), ensure_ascii=False, indent=2) + "\n"
     )
-    app.state.worker.close()
+
+
+if __name__ == "__main__":
+    main()

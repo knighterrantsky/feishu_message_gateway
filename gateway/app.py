@@ -1,65 +1,41 @@
 import asyncio
-import fcntl
-import hmac
 import logging
-import sqlite3
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, Request
+from anyio import CancelScope
+from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError
 from starlette.exceptions import HTTPException
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+from gateway.auth import Authorization, Principal
+from gateway.commands import Commands
 from gateway.config import Settings
-from gateway.feishu import Feishu, Receiver, UpstreamError
+from gateway.feishu import Feishu, Receiver
 from gateway.logging import configure
-from gateway.store import Conflict, Store
-from gateway.worker import Worker
-
-
-class APIError(Exception):
-    def __init__(self, code: str, status: int):
-        self.code, self.status = code, status
-
-
-class ErrorDetail(BaseModel):
-    code: str
-    message: str
-
-
-class ErrorResponse(BaseModel):
-    error: ErrorDetail
-
-
-class TextBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1, max_length=10000)
-
-
-class SendBody(TextBody):
-    chat_id: str = Field(min_length=1, max_length=128, pattern=r"^oc_[A-Za-z0-9_-]+$")
-
-
-class Delivery(BaseModel):
-    delivery_id: str
-    kind: str
-    status: str
-    attempts: int
-    total_attempts: int
-    created_at: float
-    updated_at: float
-    next_attempt_at: float
-    last_error: str | None
-    result_message_id: str | None
-
-
-def public(row: dict[str, Any]) -> Delivery:
-    return Delivery.model_validate(row)
-
+from gateway.models import (
+    APIError,
+    Connect,
+    ErrorResponse,
+    ReplyRPC,
+    RPCFrame,
+    SendBody,
+    SendResult,
+    SendRPC,
+    Subscribe,
+    TextBody,
+    TokenRequest,
+    TokenResponse,
+    Unsubscribe,
+)
+from gateway.relay import Connection, Relay
 
 Bearer = HTTPBearer(auto_error=False)
 IdempotencyKey = Annotated[
@@ -67,180 +43,343 @@ IdempotencyKey = Annotated[
 ]
 
 
-def create_app(
-    settings: Settings, *, feishu: Any = None, receiver: Any = None, run_worker: bool = True
-) -> FastAPI:
+def error_body(code: str, request_id: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": code, "request_id": request_id}}
+
+
+class BodyLimit:
+    def __init__(self, app: ASGIApp, limit: int):
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        scope.setdefault("state", {})["request_id"] = str(uuid.uuid4())
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.limit:
+                response = JSONResponse(
+                    error_body("request_too_large", scope["state"]["request_id"]),
+                    status_code=413,
+                )
+                await response(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        consumed = False
+
+        async def replay() -> Any:
+            nonlocal consumed
+            if not consumed:
+                consumed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+def create_app(settings: Settings, *, feishu: Any = None, receiver: Any = None) -> FastAPI:
     configure(settings)
-    store = Store(settings.data_dir)
+    auth = Authorization(settings)
     feishu = feishu if feishu is not None else Feishu(settings)
     receiver = receiver if receiver is not None else Receiver(settings)
-    worker = Worker(store, settings, feishu)
+    relay = Relay(settings)
+    commands = Commands(settings, feishu)
+    boot_id = str(uuid.uuid4())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        lock = (settings.data_dir / "gateway.lock").open("a")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            raise RuntimeError("Only one gateway process may use DATA_DIR") from None
-        app.state.instance_lock = lock
-        store.recover()
         receiver.start()
-        if run_worker:
-            worker.thread.start()
-
-        async def supervise() -> None:
-            while True:
-                await asyncio.sleep(5)
-                receiver.ensure_alive()
-
-        supervisor = asyncio.create_task(supervise())
         app.state.stopping = False
+
+        async def pump() -> None:
+            ticks = 0
+            while True:
+                for event in receiver.drain():
+                    relay.publish(event)
+                ticks += 1
+                if ticks >= 100:
+                    receiver.ensure_alive()
+                    commands.prune()
+                    ticks = 0
+                await asyncio.sleep(0.05)
+
+        task = asyncio.create_task(pump())
+        app.state.pump = task
         try:
             yield
         finally:
             app.state.stopping = True
-            supervisor.cancel()
+            commands.stopping = True
+            for connection in tuple(relay.connections):
+                relay.disconnect(connection, "server_shutdown")
+            task.cancel()
             with suppress(asyncio.CancelledError):
-                await supervisor
+                await task
             await asyncio.to_thread(receiver.close)
-            await asyncio.to_thread(worker.close)
-            # If a bounded shutdown expires, keep the process lock until process exit.
-            if not worker.thread.is_alive():
-                lock.close()
+            await commands.close()
 
     app = FastAPI(
-        title="Feishu Message Gateway",
+        title="Feishu Realtime Relay",
         version=settings.code_version,
         lifespan=lifespan,
-        responses={code: {"model": ErrorResponse} for code in (401, 404, 409, 422, 500, 503)},
+        description="Best-effort live events over /v1/ws; no durable messages or offline replay.",
+        responses={
+            code: {"model": ErrorResponse}
+            for code in (401, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504)
+        },
     )
-    app.state.store, app.state.worker, app.state.receiver = store, worker, receiver
-    app.state.stopping = False
+    app.add_middleware(BodyLimit, limit=settings.max_message_bytes)
+    app.state.relay, app.state.commands, app.state.auth = relay, commands, auth
+    app.state.receiver, app.state.stopping = receiver, False
 
     def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(Bearer)],
-    ) -> None:
-        supplied = credentials.credentials if credentials else ""
-        if not hmac.compare_digest(
-            supplied.encode(), settings.api_access_token.get_secret_value().encode()
-        ):
-            raise APIError("unauthorized", 401)
-
-    def error_response(code: str, status: int) -> JSONResponse:
-        headers = {"WWW-Authenticate": "Bearer"} if status == 401 else None
-        return JSONResponse(
-            status_code=status, content={"error": {"code": code, "message": code}}, headers=headers
-        )
+    ) -> Principal:
+        return auth.authenticate(credentials.credentials if credentials else "")
 
     @app.exception_handler(APIError)
     async def api_error(request: Request, exc: APIError) -> JSONResponse:
-        return error_response(exc.code, exc.status)
-
-    @app.exception_handler(Conflict)
-    async def conflict(request: Request, exc: Conflict) -> JSONResponse:
-        return error_response("idempotency_conflict", 409)
+        headers = {"WWW-Authenticate": "Bearer"} if exc.status == 401 else None
+        return JSONResponse(
+            error_body(exc.code, request.state.request_id), status_code=exc.status, headers=headers
+        )
 
     @app.exception_handler(RequestValidationError)
-    async def validation(request: Request, exc: RequestValidationError) -> JSONResponse:
-        return error_response("invalid_request", 422)
+    async def invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            error_body("invalid_request", request.state.request_id), status_code=422
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
-        return error_response("http_" + str(exc.status_code), exc.status_code)
-
-    @app.exception_handler(sqlite3.Error)
-    async def storage_error(request: Request, exc: sqlite3.Error) -> JSONResponse:
-        return error_response("storage_unavailable", 503)
+        return JSONResponse(
+            error_body("http_" + str(exc.status_code), request.state.request_id),
+            status_code=exc.status_code,
+        )
 
     @app.exception_handler(Exception)
     async def unexpected(request: Request, exc: Exception) -> JSONResponse:
         logging.getLogger(__name__).error("request_failed type=%s", type(exc).__name__)
-        return error_response("internal_error", 500)
+        return JSONResponse(error_body("internal_error", request.state.request_id), status_code=500)
 
-    protected = [Depends(authenticate)]
+    @app.post("/v1/tokens", response_model=TokenResponse)
+    def issue(
+        body: TokenRequest,
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(Bearer)],
+    ) -> JSONResponse:
+        auth.admin(credentials.credentials if credentials else "")
+        token = auth.issue(body)
+        return JSONResponse(token.model_dump(), headers={"Cache-Control": "no-store"})
 
-    @app.post("/v1/messages", status_code=202, response_model=Delivery, dependencies=protected)
-    def send(body: SendBody, idempotency_key: IdempotencyKey) -> Delivery:
-        return public(
-            store.enqueue("send", body.chat_id, "api:" + idempotency_key, body.model_dump())
+    @app.post("/v1/messages", response_model=SendResult)
+    async def send(
+        body: SendBody,
+        idempotency_key: IdempotencyKey,
+        principal: Annotated[Principal, Depends(authenticate)],
+    ) -> SendResult:
+        return await commands.execute(
+            principal, "send", body.chat_id, body.text, idempotency_key, body.session_id
         )
 
-    @app.post(
-        "/v1/messages/{message_id}/replies",
-        status_code=202,
-        response_model=Delivery,
-        dependencies=protected,
-    )
-    def reply(message_id: str, body: TextBody, idempotency_key: IdempotencyKey) -> Delivery:
+    @app.post("/v1/messages/{message_id}/replies", response_model=SendResult)
+    async def reply(
+        message_id: str,
+        body: TextBody,
+        idempotency_key: IdempotencyKey,
+        principal: Annotated[Principal, Depends(authenticate)],
+    ) -> SendResult:
         if len(message_id) > 128 or not message_id.startswith("om_"):
             raise APIError("invalid_message_id", 422)
-        existing = store.by_key("api:" + idempotency_key)
-        if existing:
-            return public(
-                store.enqueue(
-                    "reply",
-                    existing["chat_id"],
-                    "api:" + idempotency_key,
-                    {"message_id": message_id, "text": body.text},
-                )
-            )
-        chat_id = store.chat_for(message_id)
-        if not chat_id:
-            try:
-                chat_id = feishu.chat_for(message_id)
-            except UpstreamError as exc:
-                raise APIError(exc.code, 503 if exc.retryable else 404) from None
-            except Exception:
-                raise APIError("upstream_unavailable", 503) from None
-        return public(
-            store.enqueue(
-                "reply",
-                chat_id,
-                "api:" + idempotency_key,
-                {"message_id": message_id, "text": body.text},
-            )
+        return await commands.execute(
+            principal, "reply", message_id, body.text, idempotency_key, body.session_id
         )
 
-    @app.get("/v1/deliveries/{delivery_id}", response_model=Delivery, dependencies=protected)
-    def delivery(delivery_id: str) -> Delivery:
-        row = store.get(delivery_id)
-        if row is None:
-            raise APIError("delivery_not_found", 404)
-        return public(row)
-
-    @app.post(
-        "/v1/deliveries/{delivery_id}/replay", response_model=Delivery, dependencies=protected
-    )
-    def replay(delivery_id: str) -> Delivery:
-        if store.get(delivery_id) is None:
-            raise APIError("delivery_not_found", 404)
-        if not store.replay(delivery_id):
-            raise APIError("delivery_not_dead", 409)
-        row = store.get(delivery_id)
-        assert row is not None
-        return public(row)
-
-    @app.get("/v1/status", dependencies=protected)
-    def status() -> dict[str, Any]:
+    def status_payload() -> dict[str, Any]:
         return {
             "version": settings.code_version,
+            "boot_id": boot_id,
             "long_connection": receiver.connected,
-            "worker_alive": worker.thread.is_alive(),
-            **store.stats(),
+            "receiver_restarts": receiver.restarts,
+            "outbound_active": commands.active,
+            "outbound_completed": commands.completed,
+            "outbound_failed": commands.failed,
+            "last_outbound_result": commands.last_result,
+            **relay.stats(),
         }
 
+    @app.get("/v1/status")
+    async def status(principal: Annotated[Principal, Depends(authenticate)]) -> dict[str, Any]:
+        principal.require("status.read", settings.feishu_app_id)
+        return status_payload()
+
     @app.get("/healthz")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "alive", "version": settings.code_version}
 
     @app.get("/readyz")
-    def ready() -> dict[str, str]:
-        with store.db() as db:
-            db.execute("SELECT 1")
-        if app.state.stopping or not receiver.connected or not worker.thread.is_alive():
+    async def ready() -> dict[str, str]:
+        if app.state.stopping or app.state.pump.done() or not receiver.connected:
             raise APIError("not_ready", 503)
         return {"status": "ready", "version": settings.code_version}
+
+    async def rpc(connection: Connection, frame: RPCFrame) -> Any:
+        connection.principal.active()
+        if frame.method == "subscribe":
+            body = Subscribe.model_validate(frame.params)
+            relay.subscribe(connection, body)
+            return {"subscription_id": body.subscription_id, "filter": body.filter.model_dump()}
+        if frame.method == "unsubscribe":
+            sid = Unsubscribe.model_validate(frame.params).subscription_id
+            if sid not in connection.subscriptions:
+                raise APIError("subscription_not_found", 404)
+            del connection.subscriptions[sid]
+            return {"subscription_id": sid}
+        if frame.method == "messages.send":
+            sb = SendRPC.model_validate(frame.params)
+            return (
+                await commands.execute(
+                    connection.principal,
+                    "send",
+                    sb.chat_id,
+                    sb.text,
+                    sb.idempotency_key,
+                    sb.session_id,
+                )
+            ).model_dump()
+        if frame.method == "messages.reply":
+            rb = ReplyRPC.model_validate(frame.params)
+            return (
+                await commands.execute(
+                    connection.principal,
+                    "reply",
+                    rb.message_id,
+                    rb.text,
+                    rb.idempotency_key,
+                    rb.session_id,
+                )
+            ).model_dump()
+        if frame.method == "status.get":
+            if frame.params:
+                raise APIError("invalid_request", 422)
+            connection.principal.require("status.read", settings.feishu_app_id)
+            return status_payload()
+        raise APIError("unknown_method", 404)
+
+    @app.websocket("/v1/ws")
+    async def websocket(ws: WebSocket) -> None:
+        # Limits unauthenticated sockets as well as established connections.
+        pending = getattr(app.state, "ws_count", 0)
+        if app.state.stopping or pending >= settings.max_connections:
+            await ws.close(code=1013)
+            return
+        app.state.ws_count = pending + 1
+        connection: Connection | None = None
+        tasks: list[asyncio.Task[Any]] = []
+
+        async def receive_frame() -> RPCFrame:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            raw = message.get("text")
+            if raw is None or len(raw.encode()) > settings.max_message_bytes:
+                raise APIError("invalid_frame", 422)
+            return RPCFrame.model_validate_json(raw)
+
+        try:
+            await ws.accept()
+            async with asyncio.timeout(settings.ws_auth_timeout_seconds):
+                initial = await receive_frame()
+                if initial.method != "connect":
+                    raise APIError("connect_required", 401)
+                token = Connect.model_validate(initial.params).token
+                principal = auth.authenticate(token)
+                connection = relay.connect(principal)
+                await ws.send_json(
+                    {
+                        "type": "res",
+                        "id": initial.id,
+                        "ok": True,
+                        "payload": {
+                            "connection_id": connection.id,
+                            "boot_id": boot_id,
+                            "protocol_version": 1,
+                            "expires_at": principal.expires_at,
+                        },
+                    }
+                )
+
+            async def writer(c: Connection) -> None:
+                while True:
+                    data, size = await c.queue.get()
+                    try:
+                        c.principal.active()
+                        await asyncio.wait_for(
+                            ws.send_text(data), settings.ws_write_timeout_seconds
+                        )
+                    except TimeoutError:
+                        relay.slow_consumers += 1
+                        relay.dropped += 1
+                        relay.disconnect(c, "slow_consumer")
+                        return
+                    finally:
+                        relay.release(c, size)
+
+            async def reader(c: Connection) -> None:
+                while True:
+                    frame = await receive_frame()
+                    try:
+                        result = await rpc(c, frame)
+                        response = {"type": "res", "id": frame.id, "ok": True, "payload": result}
+                    except (ValidationError, APIError) as exc:
+                        code = exc.code if isinstance(exc, APIError) else "invalid_request"
+                        response = {
+                            "type": "res",
+                            "id": frame.id,
+                            "ok": False,
+                            "error": error_body(code, frame.id)["error"],
+                        }
+                    if not relay.enqueue(c, response):
+                        return
+
+            async def expiry(c: Connection) -> None:
+                await asyncio.sleep(max(0, c.principal.expires_at - time.time()))
+                relay.disconnect(c, "token_expired")
+
+            tasks = [
+                asyncio.create_task(writer(connection)),
+                asyncio.create_task(reader(connection)),
+                asyncio.create_task(expiry(connection)),
+                asyncio.create_task(connection.closed.wait()),
+            ]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except (WebSocketDisconnect, ValidationError, APIError, TimeoutError):
+            pass
+        except Exception as exc:
+            logging.getLogger(__name__).error("websocket_failed type=%s", type(exc).__name__)
+        finally:
+            with CancelScope(shield=True):
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                if connection is not None:
+                    relay.disconnect(connection)
+                app.state.ws_count -= 1
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        ws.close(
+                            code=1008,
+                            reason=connection.reason if connection else "authentication_failed",
+                        ),
+                        1,
+                    )
 
     return app
